@@ -1,17 +1,13 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import requests
 
-# Fix yfinance Yahoo Finance blocking on cloud servers
-from curl_cffi import requests as curl_requests
-yf.base._CURL_CFFI_AVAILABLE = True
-
-app = FastAPI(title="11% Trading API", version="1.0.0")
+app = FastAPI(title="11% Trading API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,14 +16,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Data fetcher with retry ───────────────────────────────────────────────────
+# ── Bypass Yahoo Finance blocking with a proper session ───────────────────────
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    })
+    return s
+
 def get_data(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
     try:
-        session = curl_requests.Session(impersonate="chrome110")
+        session = make_session()
         t = yf.Ticker(ticker, session=session)
         df = t.history(start=start, end=end, interval=interval, auto_adjust=True)
-        if df.empty:
-            raise HTTPException(status_code=404, detail=f"No data for {ticker}")
+        if df is None or df.empty:
+            # Try download as fallback
+            df = yf.download(ticker, start=start, end=end, interval=interval, 
+                           auto_adjust=True, progress=False, session=session)
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
         df = df.dropna()
         return df
     except HTTPException:
@@ -36,25 +50,21 @@ def get_data(ticker: str, start: str, end: str, interval: str = "1d") -> pd.Data
         raise HTTPException(status_code=404, detail=f"Failed to fetch {ticker}: {str(e)}")
 
 def safe_float(v):
-    if v is None: return None
     try:
         f = float(v)
-        if np.isnan(f) or np.isinf(f): return None
-        return f
-    except: return None
+        return None if (np.isnan(f) or np.isinf(f)) else f
+    except:
+        return None
 
-def df_to_ohlcv(df: pd.DataFrame) -> list:
-    result = []
-    for ts, row in df.iterrows():
-        result.append({
-            "time":   int(pd.Timestamp(ts).timestamp()),
-            "open":   safe_float(row.get("Open")),
-            "high":   safe_float(row.get("High")),
-            "low":    safe_float(row.get("Low")),
-            "close":  safe_float(row.get("Close")),
-            "volume": safe_float(row.get("Volume")),
-        })
-    return result
+def df_to_ohlcv(df):
+    return [{
+        "time":   int(pd.Timestamp(ts).timestamp()),
+        "open":   safe_float(row.get("Open")),
+        "high":   safe_float(row.get("High")),
+        "low":    safe_float(row.get("Low")),
+        "close":  safe_float(row.get("Close")),
+        "volume": safe_float(row.get("Volume")),
+    } for ts, row in df.iterrows()]
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def sma(s, p): return s.rolling(p).mean()
@@ -73,16 +83,16 @@ def macd(s, fast=12, slow=26, signal=9):
 
 def bollinger(s, p=20, std=2):
     mid = sma(s, p)
-    sd  = s.rolling(p).std()
+    sd = s.rolling(p).std()
     return mid + std*sd, mid, mid - std*sd
 
-def atr(df, p=14):
+def atr_calc(df, p=14):
     h, l, c = df["High"], df["Low"], df["Close"]
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(p).mean()
 
 def supertrend(df, p=10, m=3):
-    a = atr(df, p)
+    a = atr_calc(df, p)
     hl2 = (df["High"] + df["Low"]) / 2
     upper = hl2 + m * a
     lower = hl2 - m * a
@@ -144,10 +154,9 @@ def run_backtest(df, strategy, params, capital):
     for i in range(1, len(df)):
         sig = signals.iloc[i]
         price = float(close.iloc[i])
-        date  = str(df.index[i].date())
+        date = str(df.index[i].date())
         if position == 0 and sig == 1:
-            shares = balance / price
-            position = shares
+            position = balance / price
             entry_price = price
         elif position > 0 and sig == -1:
             exit_val = position * price
@@ -165,14 +174,13 @@ def run_backtest(df, strategy, params, capital):
 
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
-    total_return = (balance - capital) / capital * 100
     eq = pd.Series(equity)
     drawdown = ((eq - eq.cummax()) / eq.cummax() * 100).min()
-    returns = eq.pct_change().dropna()
-    sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+    rets = eq.pct_change().dropna()
+    sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
 
     return {
-        "total_return":  round(total_return, 2),
+        "total_return":  round((balance - capital) / capital * 100, 2),
         "final_equity":  round(balance, 2),
         "total_trades":  len(trades),
         "win_rate":      round(len(wins)/len(trades)*100, 1) if trades else 0,
@@ -197,7 +205,7 @@ def get_ohlcv(ticker: str = Query(...), start: str = Query(...), end: str = Quer
 @app.get("/api/ticker-info")
 def ticker_info(ticker: str = Query(...)):
     try:
-        session = curl_requests.Session(impersonate="chrome110")
+        session = make_session()
         t = yf.Ticker(ticker, session=session)
         info = t.info
         return {
@@ -225,8 +233,7 @@ class BacktestRequest(BaseModel):
 def backtest(req: BacktestRequest):
     try:
         df = get_data(req.ticker, req.start, req.end)
-        result = run_backtest(df, req.strategy, req.params, req.capital)
-        return {"ticker": req.ticker, "strategy": req.strategy, **result}
+        return {"ticker": req.ticker, "strategy": req.strategy, **run_backtest(df, req.strategy, req.params, req.capital)}
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -252,14 +259,14 @@ def get_indicators(ticker: str = Query(...), start: str = Query(...), end: str =
     elif indicator == "EMA":
         result = {"ema12":[safe_float(v) for v in ema(close,12)],"ema26":[safe_float(v) for v in ema(close,26)]}
     elif indicator == "ATR":
-        result["atr"] = [safe_float(v) for v in atr(df)]
+        result["atr"] = [safe_float(v) for v in atr_calc(df)]
     result["dates"] = [str(d.date()) for d in df.index]
     return result
 
 @app.get("/api/screener")
 def screener(tickers: str = Query(...)):
     results = []
-    end   = datetime.now().strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
     for ticker in tickers.split(",")[:20]:
         ticker = ticker.strip().upper()
@@ -283,7 +290,7 @@ def screener(tickers: str = Query(...)):
 @app.get("/api/earnings")
 def earnings(ticker: str = Query(...)):
     try:
-        session = curl_requests.Session(impersonate="chrome110")
+        session = make_session()
         t = yf.Ticker(ticker, session=session)
         cal = t.calendar
         hist = t.earnings_history
@@ -305,15 +312,14 @@ def correlations(tickers: str = Query(...), start: str = Query(...), end: str = 
         except: continue
     if len(closes) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 valid tickers")
-    combined = pd.DataFrame(closes).dropna()
-    corr = combined.pct_change().dropna().corr()
+    corr = pd.DataFrame(closes).dropna().pct_change().dropna().corr()
     return {"tickers": list(closes.keys()), "matrix": corr.round(3).to_dict()}
 
 @app.get("/api/monte-carlo")
 def monte_carlo(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), simulations: int = Query(500), days: int = Query(252), capital: float = Query(10000)):
     df = get_data(ticker, start, end)
-    returns = df["Close"].pct_change().dropna()
-    mu, sigma = float(returns.mean()), float(returns.std())
+    rets = df["Close"].pct_change().dropna()
+    mu, sigma = float(rets.mean()), float(rets.std())
     paths, finals = [], []
     for _ in range(min(simulations, 500)):
         path = [capital]
