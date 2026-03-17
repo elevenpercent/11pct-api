@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import requests
 import os
 
-app = FastAPI(title=“11% Trading API”, version=“3.0.0”)
+app = FastAPI(title=“11% Trading API”, version=“4.0.0”)
 
 app.add_middleware(
 CORSMiddleware,
@@ -16,74 +16,45 @@ allow_methods=[”*”],
 allow_headers=[”*”],
 )
 
-AV_KEY = os.environ.get(“ALPHA_VANTAGE_KEY”, “FYRG8Q3IHG14Z2VY”)
-AV_BASE = “https://www.alphavantage.co/query”
+POLY_KEY  = os.environ.get(“POLYGON_KEY”, “V0HolJbbDoYAR8pAWfprGFbYlzmpG2Mr”)
+POLY_BASE = “https://api.polygon.io”
 
-# ── Alpha Vantage data fetcher ────────────────────────────────────────────────
+# ── Polygon.io data fetcher ───────────────────────────────────────────────────
 
 def get_data(ticker: str, start: str, end: str, interval: str = “1d”) -> pd.DataFrame:
 try:
-# Map interval to Alpha Vantage function
-if interval in [“1d”, “1wk”]:
-if interval == “1wk”:
-func = “TIME_SERIES_WEEKLY_ADJUSTED”
-key  = “Weekly Adjusted Time Series”
-else:
-func = “TIME_SERIES_DAILY_ADJUSTED”
-key  = “Time Series (Daily)”
-params = {
-“function”:   func,
-“symbol”:     ticker,
-“outputsize”: “full”,
-“apikey”:     AV_KEY,
-}
-else:
-# Intraday
-av_interval = “60min” if interval == “1h” else “5min”
-params = {
-“function”:   “TIME_SERIES_INTRADAY”,
-“symbol”:     ticker,
-“interval”:   av_interval,
-“outputsize”: “full”,
-“apikey”:     AV_KEY,
-}
-key = f”Time Series ({av_interval})”
+# Map interval to Polygon multiplier/timespan
+if interval == “1d”:   mult, span = 1, “day”
+elif interval == “1wk”: mult, span = 1, “week”
+elif interval == “1h”:  mult, span = 1, “hour”
+elif interval == “5m”:  mult, span = 5, “minute”
+else:                   mult, span = 1, “day”
 
 ```
-    r = requests.get(AV_BASE, params=params, timeout=30)
+    url = f"{POLY_BASE}/v2/aggs/ticker/{ticker.upper()}/range/{mult}/{span}/{start}/{end}"
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLY_KEY}
+    r = requests.get(url, params=params, timeout=30)
     data = r.json()
 
-    if "Note" in data:
-        raise HTTPException(status_code=429, detail="Alpha Vantage rate limit — wait 1 minute and try again")
-    if "Error Message" in data:
-        raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found")
-    if key not in data:
-        raise HTTPException(status_code=404, detail=f"No data for {ticker}")
+    if data.get("status") == "ERROR":
+        raise HTTPException(status_code=404, detail=data.get("error", f"Ticker {ticker} not found"))
+    if not data.get("results"):
+        raise HTTPException(status_code=404, detail=f"No data for {ticker} between {start} and {end}")
 
-    ts = data[key]
     rows = []
-    for date_str, vals in ts.items():
-        dt = pd.Timestamp(date_str)
-        close_key = "5. adjusted close" if "adjusted close" in " ".join(vals.keys()) else "4. close"
+    for bar in data["results"]:
         rows.append({
-            "Date":   dt,
-            "Open":   float(vals.get("1. open", 0)),
-            "High":   float(vals.get("2. high", 0)),
-            "Low":    float(vals.get("3. low", 0)),
-            "Close":  float(vals.get(close_key, vals.get("4. close", 0))),
-            "Volume": float(vals.get("6. volume", vals.get("5. volume", 0))),
+            "Date":   pd.Timestamp(bar["t"], unit="ms"),
+            "Open":   float(bar["o"]),
+            "High":   float(bar["h"]),
+            "Low":    float(bar["l"]),
+            "Close":  float(bar["c"]),
+            "Volume": float(bar.get("v", 0)),
         })
 
     df = pd.DataFrame(rows).set_index("Date").sort_index()
-
-    # Filter by date range
-    start_dt = pd.Timestamp(start)
-    end_dt   = pd.Timestamp(end)
-    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
-
     if df.empty:
-        raise HTTPException(status_code=404, detail=f"No data for {ticker} in range {start} to {end}")
-
+        raise HTTPException(status_code=404, detail=f"No data for {ticker}")
     return df
 
 except HTTPException:
@@ -243,7 +214,7 @@ return {
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get(”/”)
-def root(): return {“status”: “11% API running”, “version”: “3.0.0”}
+def root(): return {“status”: “11% API running”, “version”: “4.0.0”, “data”: “Polygon.io”}
 
 @app.get(”/api/ohlcv”)
 def get_ohlcv(ticker: str = Query(…), start: str = Query(…), end: str = Query(…), interval: str = Query(“1d”)):
@@ -253,19 +224,18 @@ return {“ticker”: ticker, “data”: df_to_ohlcv(df)}
 @app.get(”/api/ticker-info”)
 def ticker_info(ticker: str = Query(…)):
 try:
-params = {“function”: “OVERVIEW”, “symbol”: ticker, “apikey”: AV_KEY}
-r = requests.get(AV_BASE, params=params, timeout=15)
-d = r.json()
-if not d or “Symbol” not in d:
+r = requests.get(f”{POLY_BASE}/v3/reference/tickers/{ticker.upper()}”, params={“apiKey”: POLY_KEY}, timeout=15)
+d = r.json().get(“results”, {})
+if not d:
 raise HTTPException(status_code=404, detail=“Ticker not found”)
 return {
-“name”:          d.get(“Name”, ticker),
-“sector”:        d.get(“Sector”, “”),
-“market_cap”:    float(d[“MarketCapitalization”]) if d.get(“MarketCapitalization”) else None,
-“pe_ratio”:      float(d[“PERatio”]) if d.get(“PERatio”) and d[“PERatio”] != “None” else None,
-“52w_high”:      float(d[“52WeekHigh”]) if d.get(“52WeekHigh”) else None,
-“52w_low”:       float(d[“52WeekLow”]) if d.get(“52WeekLow”) else None,
-“avg_volume”:    float(d[“SharesOutstanding”]) if d.get(“SharesOutstanding”) else None,
+“name”:          d.get(“name”, ticker),
+“sector”:        d.get(“sic_description”, “”),
+“market_cap”:    d.get(“market_cap”),
+“pe_ratio”:      None,
+“52w_high”:      None,
+“52w_low”:       None,
+“avg_volume”:    None,
 “current_price”: None,
 }
 except HTTPException: raise
@@ -319,7 +289,7 @@ def screener(tickers: str = Query(…)):
 results = []
 end   = datetime.now().strftime(”%Y-%m-%d”)
 start = (datetime.now() - timedelta(days=90)).strftime(”%Y-%m-%d”)
-for ticker in tickers.split(”,”)[:5]:  # limit to 5 — AV free tier is 25 req/day
+for ticker in tickers.split(”,”)[:20]:
 ticker = ticker.strip().upper()
 try:
 df = get_data(ticker, start, end)
@@ -341,7 +311,7 @@ return {“results”: results}
 @app.get(”/api/correlations”)
 def correlations(tickers: str = Query(…), start: str = Query(…), end: str = Query(…)):
 closes = {}
-for ticker in tickers.split(”,”)[:5]:  # limit 5 for free tier
+for ticker in tickers.split(”,”)[:10]:
 ticker = ticker.strip().upper()
 try:
 df = get_data(ticker, start, end)
@@ -358,7 +328,7 @@ df = get_data(ticker, start, end)
 rets = df[“Close”].pct_change().dropna()
 mu, sigma = float(rets.mean()), float(rets.std())
 paths, finals = [], []
-for _ in range(min(simulations, 300)):
+for _ in range(min(simulations, 500)):
 path = [capital]
 for _ in range(days):
 path.append(path[-1] * (1 + np.random.normal(mu, sigma)))
