@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -9,8 +10,9 @@ import os
 import io
 import time
 
-app = FastAPI(title="11% Trading API", version="5.0.0")
+app = FastAPI(title="11% Trading API", version="6.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +25,7 @@ POLY_BASE = "https://api.polygon.io"
 
 # ── In-memory cache (survives for duration of server run) ────────────────────
 _CACHE: dict = {}
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 14400  # 4 hours for historical data
 
 def cache_get(key: str):
     if key in _CACHE:
@@ -319,7 +321,7 @@ def run_backtest(df, strategy, params, capital):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "11% API running", "version": "5.0.0", "data": "Stooq (20yr) + Polygon fallback", "cache_size": len(_CACHE)}
+    return {"status": "11% API running", "version": "6.0.0", "data": "Stooq (20yr) + Polygon fallback", "cache_size": len(_CACHE)}
 
 @app.get("/api/ohlcv")
 def get_ohlcv(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), interval: str = Query("1d")):
