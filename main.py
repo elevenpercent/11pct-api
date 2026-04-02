@@ -501,16 +501,20 @@ def get_patterns(
     sma20_vals  = [safe_float(v) for v in sma(close, 20)]
     sma50_vals  = [safe_float(v) for v in sma(close, 50)]
     rsi_vals    = [safe_float(v) for v in rsi(close)]
+    m, s, h     = macd(close)
     vol_avg     = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
     return {
         "ticker":    ticker,
         "bars":      bars,
         "patterns":  patterns,
         "indicators": {
-            "sma20":  sma20_vals,
-            "sma50":  sma50_vals,
-            "rsi":    rsi_vals,
-            "vol_avg": round(vol_avg, 0),
+            "sma20":     sma20_vals,
+            "sma50":     sma50_vals,
+            "rsi":       rsi_vals,
+            "macd":      [safe_float(v) for v in m],
+            "signal":    [safe_float(v) for v in s],
+            "histogram": [safe_float(v) for v in h],
+            "vol_avg":   round(vol_avg, 0),
         }
     }
 
