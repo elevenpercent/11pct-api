@@ -2,32 +2,23 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import requests
-import os
 import io
 import time
 
-app = FastAPI(title="11% Trading API", version="6.0.0")
-
+app = FastAPI(title="11% Trading API", version="7.0.0")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-POLY_KEY  = os.environ.get("POLYGON_KEY", "V0HolJbbDoYAR8pAWfprGFbYlzmpG2Mr")
-POLY_BASE = "https://api.polygon.io"
-
-# ── In-memory cache (survives for duration of server run) ────────────────────
+# ── Cache ──────────────────────────────────────────────────────────
 _CACHE: dict = {}
-CACHE_TTL = 14400  # 4 hours for historical data
+CACHE_TTL = 14400  # 4 hours
 
-def cache_get(key: str):
+def cache_get(key):
     if key in _CACHE:
         data, ts = _CACHE[key]
         if time.time() - ts < CACHE_TTL:
@@ -35,163 +26,117 @@ def cache_get(key: str):
         del _CACHE[key]
     return None
 
-def cache_set(key: str, data):
+def cache_set(key, data):
     _CACHE[key] = (data, time.time())
+    if len(_CACHE) > 200:
+        oldest = sorted(_CACHE.items(), key=lambda x: x[1][1])[:50]
+        for k, _ in oldest:
+            del _CACHE[k]
 
-# ── Stooq ticker mapper ───────────────────────────────────────────────────────
-def to_stooq_symbol(ticker: str) -> str:
-    ticker = ticker.upper().strip()
-    # Crypto
-    crypto_map = {
-        'BTC-USD': 'btc.v', 'ETH-USD': 'eth.v', 'SOL-USD': 'sol.v',
-        'BNB-USD': 'bnb.v', 'ADA-USD': 'ada.v', 'XRP-USD': 'xrp.v',
-        'DOGE-USD': 'doge.v', 'AVAX-USD': 'avax.v',
-    }
-    if ticker in crypto_map:
-        return crypto_map[ticker]
-    # Indices
-    index_map = {
-        'SPY': 'spy.us', 'QQQ': 'qqq.us', 'DIA': 'dia.us', 'IWM': 'iwm.us',
-        '^GSPC': '^spx', '^DJI': '^dji', '^IXIC': '^ndq',
-        'VTI': 'vti.us', 'GLD': 'gld.us', 'TLT': 'tlt.us', 'VXX': 'vxx.us',
-    }
-    if ticker in index_map:
-        return index_map[ticker]
-    # ETFs and stocks — add .us suffix
-    if '-' not in ticker and '^' not in ticker:
-        return f"{ticker.lower()}.us"
-    return ticker.lower()
+# ── Data Fetchers ──────────────────────────────────────────────────
+STOOQ_INTERVAL = {"1d": "d", "1wk": "w", "1mo": "m"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-# ── Stooq fetcher — 20+ years of free data, no API key ───────────────────────
+def stooq_ticker(ticker: str) -> str:
+    """Convert common tickers to Stooq format"""
+    mapping = {
+        "BTC-USD": "btc.v", "ETH-USD": "eth.v", "BNB-USD": "bnb.v",
+        "SOL-USD": "sol.v", "XRP-USD": "xrp.v", "ADA-USD": "ada.v",
+        "DOGE-USD": "doge.v", "AVAX-USD": "avax.v", "LINK-USD": "link.v",
+        "DOT-USD": "dot.v", "MATIC-USD": "matic.v",
+        "^SPX": "^spx", "^NDX": "^ndx", "^DJI": "^dji",
+        "SPY": "spy.us", "QQQ": "qqq.us", "GLD": "gld.us",
+        "TLT": "tlt.us", "VXX": "vxx.us", "IWM": "iwm.us",
+    }
+    t = ticker.upper()
+    if t in mapping:
+        return mapping[t]
+    if "." not in t and not t.startswith("^"):
+        return f"{t.lower()}.us"
+    return t.lower()
+
 def fetch_stooq(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    sym = to_stooq_symbol(ticker)
-
-    # Map interval to Stooq format
-    interval_map = {"1d": "d", "1wk": "w", "1mo": "m", "1h": "h"}
-    stooq_interval = interval_map.get(interval, "d")
-
-    start_fmt = start.replace("-", "")
-    end_fmt   = end.replace("-", "")
-
-    url = f"https://stooq.com/q/d/l/?s={sym}&d1={start_fmt}&d2={end_fmt}&i={stooq_interval}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://stooq.com/",
-    }
-
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"Stooq returned {r.status_code}")
-
-    content = r.text.strip()
-    if not content or "No data" in content or len(content) < 50:
-        raise Exception(f"No data from Stooq for {ticker}")
-
-    df = pd.read_csv(io.StringIO(content))
+    stooq_t  = stooq_ticker(ticker)
+    freq     = STOOQ_INTERVAL.get(interval, "d")
+    url      = f"https://stooq.com/q/d/l/?s={stooq_t}&d1={start.replace('-','')}&d2={end.replace('-','')}&i={freq}"
+    res      = requests.get(url, headers=HEADERS, timeout=15)
+    if res.status_code != 200 or len(res.content) < 50:
+        raise HTTPException(404, f"No data for {ticker}")
+    df = pd.read_csv(io.StringIO(res.text))
+    if df.empty or "Date" not in df.columns:
+        raise HTTPException(404, f"No data for {ticker}")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").set_index("Date")
     df.columns = [c.strip() for c in df.columns]
-
-    # Normalize column names
-    col_map = {
-        'Date': 'Date', 'Open': 'Open', 'High': 'High', 'Low': 'Low',
-        'Close': 'Close', 'Volume': 'Volume'
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-    if 'Date' not in df.columns:
-        raise Exception("Unexpected Stooq response format")
-
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.set_index('Date').sort_index()
-
-    # Filter to requested range
-    df = df[(df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))]
-
-    if df.empty:
-        raise Exception(f"No data for {ticker} in range {start} to {end}")
-
-    # Ensure numeric columns
-    for col in ['Open','High','Low','Close']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    if 'Volume' in df.columns:
-        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0)
-
-    df = df.dropna(subset=['Close'])
+    rename = {"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}
+    df = df.rename(columns=rename)
+    df = df.dropna(subset=["Close"])
     return df
 
-# ── Polygon fallback for data Stooq doesn't have ────────────────────────────
-def fetch_polygon(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    if interval == "1d":   mult, span = 1, "day"
-    elif interval == "1wk": mult, span = 1, "week"
-    elif interval == "1h":  mult, span = 1, "hour"
-    else:                   mult, span = 1, "day"
-
-    url = f"{POLY_BASE}/v2/aggs/ticker/{ticker.upper()}/range/{mult}/{span}/{start}/{end}"
-    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLY_KEY}
-    r = requests.get(url, params=params, timeout=30)
-    data = r.json()
-
+def fetch_polygon_fallback(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    """Polygon.io fallback - daily only"""
+    POLY_KEY = "V0HolJbbDoYAR8pAWfprGFbYlzmpG2Mr"
+    mult, span = (1, "day") if interval == "1d" else (1, "week")
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker.upper()}/range/{mult}/{span}/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLY_KEY}"
+    res = requests.get(url, timeout=15)
+    if res.status_code != 200:
+        raise HTTPException(404, f"No data for {ticker}")
+    data = res.json()
     if not data.get("results"):
-        raise Exception(f"No data from Polygon for {ticker}")
-
+        raise HTTPException(404, f"No data for {ticker}")
     rows = []
-    for bar in data["results"]:
-        rows.append({
-            "Date":   pd.Timestamp(bar["t"], unit="ms"),
-            "Open":   float(bar["o"]), "High": float(bar["h"]),
-            "Low":    float(bar["l"]), "Close": float(bar["c"]),
-            "Volume": float(bar.get("v", 0)),
-        })
+    for r in data["results"]:
+        rows.append({"Date": pd.Timestamp(r["t"], unit="ms"),
+                     "Open": r["o"], "High": r["h"], "Low": r["l"],
+                     "Close": r["c"], "Volume": r.get("v", 0)})
     df = pd.DataFrame(rows).set_index("Date").sort_index()
     return df
 
-# ── Main data getter with caching and fallback ───────────────────────────────
 def get_data(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    cache_key = f"{ticker}_{start}_{end}_{interval}"
-    cached = cache_get(cache_key)
+    key = f"{ticker}_{start}_{end}_{interval}"
+    cached = cache_get(key)
     if cached is not None:
         return cached
-
-    # Try Stooq first (unlimited history, no IP blocking)
     try:
         df = fetch_stooq(ticker, start, end, interval)
-        if not df.empty:
-            cache_set(cache_key, df)
-            return df
-    except Exception as e:
-        print(f"Stooq failed for {ticker}: {e}, trying Polygon...")
-
-    # Fallback to Polygon
+        if df.empty:
+            raise ValueError("empty")
+        cache_set(key, df)
+        return df
+    except Exception:
+        pass
     try:
-        df = fetch_polygon(ticker, start, end, interval)
-        if not df.empty:
-            cache_set(cache_key, df)
-            return df
-    except Exception as e:
-        print(f"Polygon failed for {ticker}: {e}")
-
-    raise HTTPException(status_code=404, detail=f"No data found for {ticker} between {start} and {end}. Try a US stock ticker like AAPL.")
+        df = fetch_polygon_fallback(ticker, start, end, interval)
+        cache_set(key, df)
+        return df
+    except Exception:
+        raise HTTPException(404, f"Could not fetch data for {ticker}. Try a different ticker or date range.")
 
 def safe_float(v):
+    if v is None: return None
     try:
         f = float(v)
         return None if (np.isnan(f) or np.isinf(f)) else f
     except: return None
 
 def df_to_ohlcv(df):
-    return [{
-        "time":   int(pd.Timestamp(ts).timestamp()),
-        "open":   safe_float(row.get("Open")),
-        "high":   safe_float(row.get("High")),
-        "low":    safe_float(row.get("Low")),
-        "close":  safe_float(row.get("Close")),
-        "volume": safe_float(row.get("Volume", 0)),
-    } for ts, row in df.iterrows()]
+    result = []
+    for ts, row in df.iterrows():
+        result.append({
+            "time":   int(pd.Timestamp(ts).timestamp()),
+            "open":   safe_float(row.get("Open")),
+            "high":   safe_float(row.get("High")),
+            "low":    safe_float(row.get("Low")),
+            "close":  safe_float(row.get("Close")),
+            "volume": safe_float(row.get("Volume")),
+        })
+    return result
 
-# ── Indicators ────────────────────────────────────────────────────────────────
+# ── Indicators ─────────────────────────────────────────────────────
 def sma(s, p): return s.rolling(p).mean()
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
@@ -199,53 +144,222 @@ def rsi(s, p=14):
     d = s.diff()
     g = d.clip(lower=0).rolling(p).mean()
     l = (-d.clip(upper=0)).rolling(p).mean()
-    return 100 - (100 / (1 + g / l.replace(0, np.nan)))
+    rs = g / l.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 def macd(s, fast=12, slow=26, signal=9):
-    m = ema(s, fast) - ema(s, slow)
-    sig = ema(m, signal)
-    return m, sig, m - sig
+    fl = ema(s, fast); sl = ema(s, slow)
+    ml = fl - sl; sig = ema(ml, signal)
+    return ml, sig, ml - sig
 
-def bollinger(s, p=20, std=2):
-    mid = sma(s, p)
-    sd = s.rolling(p).std()
-    return mid + std*sd, mid, mid - std*sd
+def bollinger_bands(s, p=20, std=2):
+    mid = sma(s, p); st = s.rolling(p).std()
+    return mid + std*st, mid, mid - std*st
 
-def atr_calc(df, p=14):
+def atr(df, p=14):
     h, l, c = df["High"], df["Low"], df["Close"]
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(p).mean()
 
-def supertrend(df, p=10, m=3):
-    a = atr_calc(df, p)
+def supertrend(df, period=10, multiplier=3):
+    a = atr(df, period)
     hl2 = (df["High"] + df["Low"]) / 2
-    upper = hl2 + m * a
-    lower = hl2 - m * a
-    c = df["Close"]
-    direction = pd.Series(1, index=df.index)
+    upper = hl2 + multiplier * a
+    lower = hl2 - multiplier * a
+    close = df["Close"]
+    st = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(0, index=df.index, dtype=int)
     for i in range(1, len(df)):
+        cu, cl = upper.iloc[i], lower.iloc[i]
         pu, pl = upper.iloc[i-1], lower.iloc[i-1]
-        upper.iloc[i] = min(upper.iloc[i], pu) if c.iloc[i-1] <= pu else upper.iloc[i]
-        lower.iloc[i] = max(lower.iloc[i], pl) if c.iloc[i-1] >= pl else lower.iloc[i]
-        if c.iloc[i] > upper.iloc[i-1]: direction.iloc[i] = 1
-        elif c.iloc[i] < lower.iloc[i-1]: direction.iloc[i] = -1
+        upper.iloc[i] = cu if cu < pu or close.iloc[i-1] > pu else pu
+        lower.iloc[i] = cl if cl > pl or close.iloc[i-1] < pl else pl
+        if close.iloc[i] > upper.iloc[i-1]: direction.iloc[i] = 1
+        elif close.iloc[i] < lower.iloc[i-1]: direction.iloc[i] = -1
         else: direction.iloc[i] = direction.iloc[i-1]
-    return direction
+        st.iloc[i] = lower.iloc[i] if direction.iloc[i] == 1 else upper.iloc[i]
+    return st, direction
 
-# ── Backtest ──────────────────────────────────────────────────────────────────
+# ── Pattern Detection ──────────────────────────────────────────────
+def detect_patterns(df: pd.DataFrame) -> list:
+    patterns = []
+    close = df["Close"].values
+    high  = df["High"].values
+    low   = df["Low"].values
+    dates = [str(d.date()) for d in df.index]
+    n = len(close)
+    if n < 20:
+        return patterns
+
+    def find_peaks(arr, min_dist=5):
+        peaks = []
+        for i in range(min_dist, len(arr)-min_dist):
+            if arr[i] == max(arr[i-min_dist:i+min_dist+1]):
+                peaks.append(i)
+        return peaks
+
+    def find_troughs(arr, min_dist=5):
+        troughs = []
+        for i in range(min_dist, len(arr)-min_dist):
+            if arr[i] == min(arr[i-min_dist:i+min_dist+1]):
+                troughs.append(i)
+        return troughs
+
+    peaks   = find_peaks(high)
+    troughs = find_troughs(low)
+
+    # Head & Shoulders
+    if len(peaks) >= 3:
+        for i in range(len(peaks)-2):
+            l, h_p, r = peaks[i], peaks[i+1], peaks[i+2]
+            lv, hv, rv = high[l], high[h_p], high[r]
+            if hv > lv and hv > rv and abs(lv-rv)/hv < 0.05 and (r-l) > 10:
+                between_troughs = [t for t in troughs if l < t < r]
+                if len(between_troughs) >= 2:
+                    neckline = (low[between_troughs[0]] + low[between_troughs[-1]]) / 2
+                    target   = neckline - (hv - neckline)
+                    patterns.append({
+                        "name": "Head & Shoulders",
+                        "type": "Reversal",
+                        "bias": "Bearish",
+                        "reliability": "High",
+                        "start_date": dates[l],
+                        "end_date": dates[r],
+                        "key_level": round(float(neckline), 2),
+                        "target": round(float(target), 2),
+                        "desc": f"Classic bearish reversal. Neckline at ${neckline:.2f}. Target ${target:.2f}.",
+                        "forming": r >= n - 5,
+                    })
+
+    # Double Top
+    if len(peaks) >= 2:
+        for i in range(len(peaks)-1):
+            p1, p2 = peaks[i], peaks[i+1]
+            v1, v2 = high[p1], high[p2]
+            if abs(v1-v2)/max(v1,v2) < 0.03 and (p2-p1) > 8:
+                between = [t for t in troughs if p1 < t < p2]
+                if between:
+                    valley = low[between[0]]
+                    target = valley - (max(v1,v2) - valley)
+                    patterns.append({
+                        "name": "Double Top",
+                        "type": "Reversal",
+                        "bias": "Bearish",
+                        "reliability": "High",
+                        "start_date": dates[p1],
+                        "end_date": dates[p2],
+                        "key_level": round(float(valley), 2),
+                        "target": round(float(target), 2),
+                        "desc": f"Two peaks at ~${v1:.2f}. Support at ${valley:.2f}. Break = bearish.",
+                        "forming": p2 >= n - 5,
+                    })
+
+    # Double Bottom
+    if len(troughs) >= 2:
+        for i in range(len(troughs)-1):
+            t1, t2 = troughs[i], troughs[i+1]
+            v1, v2 = low[t1], low[t2]
+            if abs(v1-v2)/max(v1,v2) < 0.03 and (t2-t1) > 8:
+                between = [p for p in peaks if t1 < p < t2]
+                if between:
+                    peak_val = high[between[0]]
+                    target   = peak_val + (peak_val - min(v1,v2))
+                    patterns.append({
+                        "name": "Double Bottom",
+                        "type": "Reversal",
+                        "bias": "Bullish",
+                        "reliability": "High",
+                        "start_date": dates[t1],
+                        "end_date": dates[t2],
+                        "key_level": round(float(peak_val), 2),
+                        "target": round(float(target), 2),
+                        "desc": f"Two lows at ~${v1:.2f}. Resistance at ${peak_val:.2f}. Break = bullish.",
+                        "forming": t2 >= n - 5,
+                    })
+
+    # Bull Flag
+    recent = close[-20:]
+    if len(recent) >= 10:
+        flagpole_move = (recent[5] - recent[0]) / recent[0]
+        if flagpole_move > 0.05:
+            flag_portion = recent[5:]
+            flag_range   = (max(flag_portion) - min(flag_portion)) / recent[5]
+            if flag_range < 0.04:
+                target = recent[-1] + (recent[5] - recent[0])
+                patterns.append({
+                    "name": "Bull Flag",
+                    "type": "Continuation",
+                    "bias": "Bullish",
+                    "reliability": "Medium",
+                    "start_date": dates[-15],
+                    "end_date": dates[-1],
+                    "key_level": round(float(max(flag_portion)), 2),
+                    "target": round(float(target), 2),
+                    "desc": f"Strong move up followed by tight consolidation. Target ${target:.2f} on breakout.",
+                    "forming": True,
+                })
+
+    # Bear Flag
+    if len(recent) >= 10:
+        flagpole_move = (recent[0] - recent[5]) / recent[0]
+        if flagpole_move > 0.05:
+            flag_portion = recent[5:]
+            flag_range   = (max(flag_portion) - min(flag_portion)) / recent[5]
+            if flag_range < 0.04:
+                target = recent[-1] - (recent[0] - recent[5])
+                patterns.append({
+                    "name": "Bear Flag",
+                    "type": "Continuation",
+                    "bias": "Bearish",
+                    "reliability": "Medium",
+                    "start_date": dates[-15],
+                    "end_date": dates[-1],
+                    "key_level": round(float(min(flag_portion)), 2),
+                    "target": round(float(target), 2),
+                    "desc": f"Sharp drop followed by tight consolidation. Target ${target:.2f} on breakdown.",
+                    "forming": True,
+                })
+
+    # Ascending Triangle
+    if n >= 20:
+        recent_high = high[-20:]
+        recent_low  = low[-20:]
+        resistance  = max(recent_high)
+        touches     = sum(1 for h in recent_high if abs(h - resistance)/resistance < 0.01)
+        lows_trend  = np.polyfit(range(len(recent_low)), recent_low, 1)
+        if touches >= 2 and lows_trend[0] > 0:
+            target = resistance + (resistance - min(recent_low))
+            patterns.append({
+                "name": "Ascending Triangle",
+                "type": "Continuation",
+                "bias": "Bullish",
+                "reliability": "Medium",
+                "start_date": dates[-20],
+                "end_date": dates[-1],
+                "key_level": round(float(resistance), 2),
+                "target": round(float(target), 2),
+                "desc": f"Rising support with flat resistance at ${resistance:.2f}. Bullish breakout setup.",
+                "forming": True,
+            })
+
+    return patterns[-8:]  # return up to 8 patterns
+
+# ── Backtest ────────────────────────────────────────────────────────
 def run_backtest(df, strategy, params, capital):
     close = df["Close"]
     signals = pd.Series(0, index=df.index)
 
     if strategy == "SMA Crossover":
-        f, s = sma(close, int(params.get("fast",20))), sma(close, int(params.get("slow",50)))
-        signals = pd.Series(np.where(f > s, 1, -1), index=df.index)
+        fast = sma(close, params.get("fast", 20))
+        slow = sma(close, params.get("slow", 50))
+        signals = pd.Series(np.where(fast > slow, 1, -1), index=df.index)
     elif strategy == "EMA Crossover":
-        f, s = ema(close, int(params.get("fast",12))), ema(close, int(params.get("slow",26)))
-        signals = pd.Series(np.where(f > s, 1, -1), index=df.index)
+        fast = ema(close, params.get("fast", 12))
+        slow = ema(close, params.get("slow", 26))
+        signals = pd.Series(np.where(fast > slow, 1, -1), index=df.index)
     elif strategy == "RSI":
-        r = rsi(close, int(params.get("period",14)))
-        ob, os_ = params.get("overbought",70), params.get("oversold",30)
+        r = rsi(close, params.get("period", 14))
+        ob, os_ = params.get("overbought", 70), params.get("oversold", 30)
         pos, sig = 0, []
         for v in r:
             if pd.isna(v): sig.append(0); continue
@@ -254,62 +368,60 @@ def run_backtest(df, strategy, params, capital):
             sig.append(pos)
         signals = pd.Series(sig, index=df.index)
     elif strategy == "MACD":
-        m, s, _ = macd(close, int(params.get("fast",12)), int(params.get("slow",26)), int(params.get("signal",9)))
+        m, s, _ = macd(close, params.get("fast",12), params.get("slow",26), params.get("signal",9))
         signals = pd.Series(np.where(m > s, 1, -1), index=df.index)
     elif strategy == "Bollinger Bands":
-        upper, _, lower = bollinger(close, int(params.get("period",20)), params.get("std",2))
+        upper, mid, lower = bollinger_bands(close, params.get("period",20), params.get("std",2))
         pos, sig = 0, []
-        for c2, u, l in zip(close, upper, lower):
+        for c, u, l in zip(close, upper, lower):
             if pd.isna(u): sig.append(0); continue
-            if c2 < l: pos = 1
-            elif c2 > u: pos = -1
+            if c < l: pos = 1
+            elif c > u: pos = -1
             sig.append(pos)
         signals = pd.Series(sig, index=df.index)
     elif strategy == "SuperTrend":
-        signals = supertrend(df, int(params.get("period",10)), params.get("multiplier",3))
+        _, direction = supertrend(df, params.get("period",10), params.get("multiplier",3))
+        signals = direction
     elif strategy == "EMA + RSI Filter":
-        f = ema(close, int(params.get("fast",12)))
-        s = ema(close, int(params.get("slow",26)))
-        r = rsi(close, int(params.get("rsi_period",14)))
-        signals = pd.Series(np.where((f > s) & (r < 70), 1, np.where((f < s) & (r > 30), -1, 0)), index=df.index)
+        fast = ema(close, params.get("fast",12))
+        slow = ema(close, params.get("slow",26))
+        r    = rsi(close, params.get("rsi_period",14))
+        trend   = pd.Series(np.where(fast > slow, 1, -1), index=df.index)
+        filter_ = pd.Series(np.where(r < 70, 1, np.where(r > 30, 1, 0)), index=df.index)
+        signals = trend * filter_
 
-    position, entry_price, balance = 0, 0.0, capital
-    equity, trades = [capital], []
-
+    position, entry_price, equity, trades, balance = 0, 0.0, [capital], [], capital
     for i in range(1, len(df)):
-        sig = signals.iloc[i]
+        sig   = signals.iloc[i]
         price = float(close.iloc[i])
-        date = str(df.index[i].date())
+        date  = str(df.index[i].date())
         if position == 0 and sig == 1:
-            position = balance / price
-            entry_price = price
+            position = balance / price; entry_price = price
         elif position > 0 and sig == -1:
-            exit_val = position * price
-            pnl = exit_val - (position * entry_price)
-            trades.append({"date":date,"entry":round(entry_price,2),"exit":round(price,2),"pnl":round(pnl,2),"pct":round(pnl/(position*entry_price)*100,2)})
-            balance = exit_val
-            position = 0
+            pnl = (price - entry_price) * position
+            trades.append({"date":date,"entry":entry_price,"exit":price,"pnl":round(pnl,2),"pct":round(pnl/(position*entry_price)*100,2)})
+            balance = position * price; position = 0
         equity.append(balance + (position * price if position > 0 else 0))
 
     if position > 0:
         fp = float(close.iloc[-1])
-        pnl = position * fp - position * entry_price
-        trades.append({"date":str(df.index[-1].date()),"entry":round(entry_price,2),"exit":round(fp,2),"pnl":round(pnl,2),"pct":round(pnl/(position*entry_price)*100,2)})
+        pnl = (fp - entry_price) * position
+        trades.append({"date":str(df.index[-1].date()),"entry":entry_price,"exit":fp,"pnl":round(pnl,2),"pct":round(pnl/(position*entry_price)*100,2)})
         balance = position * fp
 
-    wins   = [t for t in trades if t["pnl"] > 0]
+    wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
-    eq     = pd.Series(equity)
-    dd     = ((eq - eq.cummax()) / eq.cummax() * 100).min()
-    rets   = eq.pct_change().dropna()
-    sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if len(rets) > 1 and rets.std() > 0 else 0
+    eq = pd.Series(equity)
+    drawdown = ((eq - eq.cummax()) / eq.cummax() * 100)
+    ret = eq.pct_change().dropna()
+    sharpe = float(ret.mean() / ret.std() * np.sqrt(252)) if ret.std() > 0 else 0
 
     return {
         "total_return":  round((balance - capital) / capital * 100, 2),
         "final_equity":  round(balance, 2),
         "total_trades":  len(trades),
         "win_rate":      round(len(wins)/len(trades)*100, 1) if trades else 0,
-        "max_drawdown":  round(float(dd), 2),
+        "max_drawdown":  round(float(drawdown.min()), 2),
         "sharpe_ratio":  round(sharpe, 2),
         "avg_win":       round(sum(t["pnl"] for t in wins)/len(wins), 2) if wins else 0,
         "avg_loss":      round(sum(t["pnl"] for t in losses)/len(losses), 2) if losses else 0,
@@ -318,113 +430,142 @@ def run_backtest(df, strategy, params, capital):
         "equity_dates":  [str(d.date()) for d in df.index],
     }
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────
 @app.get("/")
-def root():
-    return {"status": "11% API running", "version": "6.0.0", "data": "Stooq (20yr) + Polygon fallback", "cache_size": len(_CACHE)}
+def root(): return {"status": "11% API v7.0 running", "data_source": "Stooq + Polygon"}
 
 @app.get("/api/ohlcv")
 def get_ohlcv(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), interval: str = Query("1d")):
     df = get_data(ticker, start, end, interval)
-    return {"ticker": ticker, "data": df_to_ohlcv(df), "bars": len(df)}
-
-@app.get("/api/ticker-info")
-def ticker_info(ticker: str = Query(...)):
-    try:
-        r = requests.get(f"{POLY_BASE}/v3/reference/tickers/{ticker.upper()}", params={"apiKey": POLY_KEY}, timeout=15)
-        d = r.json().get("results", {})
-        # Get recent price from Stooq
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        price = None
-        change = None
-        try:
-            df = get_data(ticker, start, end)
-            if len(df) >= 2:
-                price = round(float(df["Close"].iloc[-1]), 2)
-                change = round(float((df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100), 2)
-        except: pass
-        return {
-            "name":          d.get("name", ticker),
-            "sector":        d.get("sic_description", ""),
-            "market_cap":    d.get("market_cap"),
-            "current_price": price,
-            "change_pct":    change,
-            "ticker":        ticker.upper(),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-class BacktestRequest(BaseModel):
-    ticker: str
-    start: str
-    end: str
-    strategy: str
-    capital: float = 10000
-    params: dict = {}
-
-@app.post("/api/backtest")
-def backtest(req: BacktestRequest):
-    try:
-        df = get_data(req.ticker, req.start, req.end)
-        return {"ticker": req.ticker, "strategy": req.strategy, **run_backtest(df, req.strategy, req.params, req.capital)}
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    return {"ticker": ticker, "bars": df_to_ohlcv(df)}
 
 @app.get("/api/replay-data")
 def replay_data(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), interval: str = Query("1d")):
     df = get_data(ticker, start, end, interval)
-    return {"ticker": ticker, "bars": df_to_ohlcv(df), "total": len(df)}
+    return {"ticker": ticker, "bars": df_to_ohlcv(df)}
 
-@app.get("/api/indicators")
-def get_indicators(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), indicator: str = Query(...)):
-    df = get_data(ticker, start, end)
+@app.get("/api/ticker-info")
+def ticker_info(ticker: str = Query(...)):
+    """Get basic price info from Stooq"""
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    try:
+        df = get_data(ticker, start, end)
+        close = df["Close"]
+        current = float(close.iloc[-1])
+        prev    = float(close.iloc[-2]) if len(close) > 1 else current
+        w52high = float(close.tail(252).max())
+        w52low  = float(close.tail(252).min())
+        r = rsi(close)
+        m, s, _ = macd(close)
+        volume  = float(df["Volume"].iloc[-1]) if "Volume" in df.columns else None
+        avg_vol = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else None
+        sma20_val = float(sma(close, 20).iloc[-1]) if len(close) >= 20 else None
+        sma50_val = float(sma(close, 50).iloc[-1]) if len(close) >= 50 else None
+        sma200_val = float(sma(close, 200).iloc[-1]) if len(close) >= 200 else None
+        return {
+            "name":          ticker.upper(),
+            "sector":        "",
+            "current_price": round(current, 2),
+            "prev_close":    round(prev, 2),
+            "change":        round((current - prev) / prev * 100, 2),
+            "52w_high":      round(w52high, 2),
+            "52w_low":       round(w52low, 2),
+            "avg_volume":    int(avg_vol) if avg_vol else None,
+            "volume":        int(volume) if volume else None,
+            "rsi":           round(float(r.iloc[-1]), 1) if not pd.isna(r.iloc[-1]) else None,
+            "macd":          round(float(m.iloc[-1]), 3) if not pd.isna(m.iloc[-1]) else None,
+            "macd_signal":   round(float(s.iloc[-1]), 3) if not pd.isna(s.iloc[-1]) else None,
+            "sma20":         round(sma20_val, 2) if sma20_val else None,
+            "sma50":         round(sma50_val, 2) if sma50_val else None,
+            "sma200":        round(sma200_val, 2) if sma200_val else None,
+            "above_sma20":   current > sma20_val if sma20_val else None,
+            "above_sma50":   current > sma50_val if sma50_val else None,
+            "above_sma200":  current > sma200_val if sma200_val else None,
+        }
+    except Exception as e:
+        raise HTTPException(404, f"Could not fetch data for {ticker}: {str(e)}")
+
+@app.get("/api/patterns")
+def get_patterns(
+    ticker:   str = Query(...),
+    start:    str = Query(...),
+    end:      str = Query(...),
+    interval: str = Query("1d")
+):
+    df = get_data(ticker, start, end, interval)
+    patterns = detect_patterns(df)
+    bars = df_to_ohlcv(df)
+    # Calculate indicators for chart overlay
     close = df["Close"]
-    result = {}
-    if indicator == "RSI":   result["rsi"] = [safe_float(v) for v in rsi(close)]
-    elif indicator == "MACD":
-        m, s, h = macd(close)
-        result = {"macd":[safe_float(v) for v in m],"signal":[safe_float(v) for v in s],"histogram":[safe_float(v) for v in h]}
-    elif indicator == "BB":
-        u, mid, l = bollinger(close)
-        result = {"upper":[safe_float(v) for v in u],"mid":[safe_float(v) for v in mid],"lower":[safe_float(v) for v in l]}
-    elif indicator == "SMA":
-        result = {"sma20":[safe_float(v) for v in sma(close,20)],"sma50":[safe_float(v) for v in sma(close,50)],"sma200":[safe_float(v) for v in sma(close,200)]}
-    elif indicator == "EMA":
-        result = {"ema12":[safe_float(v) for v in ema(close,12)],"ema26":[safe_float(v) for v in ema(close,26)]}
-    elif indicator == "ATR":
-        result["atr"] = [safe_float(v) for v in atr_calc(df)]
-    result["dates"] = [str(d.date()) for d in df.index]
-    return result
+    sma20_vals  = [safe_float(v) for v in sma(close, 20)]
+    sma50_vals  = [safe_float(v) for v in sma(close, 50)]
+    rsi_vals    = [safe_float(v) for v in rsi(close)]
+    vol_avg     = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
+    return {
+        "ticker":    ticker,
+        "bars":      bars,
+        "patterns":  patterns,
+        "indicators": {
+            "sma20":  sma20_vals,
+            "sma50":  sma50_vals,
+            "rsi":    rsi_vals,
+            "vol_avg": round(vol_avg, 0),
+        }
+    }
+
+class BacktestRequest(BaseModel):
+    ticker: str; start: str; end: str; strategy: str
+    capital: float = 10000; params: dict = {}
+
+@app.post("/api/backtest")
+def backtest(req: BacktestRequest):
+    if not req.ticker: raise HTTPException(400, "Ticker required")
+    try:
+        datetime.strptime(req.start, "%Y-%m-%d")
+        datetime.strptime(req.end, "%Y-%m-%d")
+    except: raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+    if req.start >= req.end: raise HTTPException(400, "Start date must be before end date")
+    if req.capital <= 0: raise HTTPException(400, "Capital must be positive")
+    df = get_data(req.ticker, req.start, req.end)
+    if len(df) < 30: raise HTTPException(400, f"Not enough data. Only {len(df)} bars found. Try a wider date range.")
+    result = run_backtest(df, req.strategy, req.params, req.capital)
+    return {"ticker": req.ticker, "strategy": req.strategy, **result}
 
 @app.get("/api/screener")
 def screener(tickers: str = Query(...)):
     results = []
     end   = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
-    for ticker in tickers.split(",")[:30]:
+    start = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+    for ticker in tickers.split(",")[:25]:
         ticker = ticker.strip().upper()
+        if not ticker: continue
         try:
-            df = get_data(ticker, start, end)
+            df    = get_data(ticker, start, end)
             close = df["Close"]
-            r = rsi(close).iloc[-1]
-            m, s, _ = macd(close)
-            sma20v = sma(close, 20).iloc[-1]
-            sma50v = sma(close, 50).iloc[-1]
-            atr_v  = atr_calc(df).iloc[-1]
+            if len(close) < 14: continue
+            r     = rsi(close)
+            m, s, h = macd(close)
+            price  = float(close.iloc[-1])
+            change = float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) > 1 else 0
+            vol    = float(df["Volume"].iloc[-1]) if "Volume" in df.columns else None
+            avg_v  = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else None
+            rel_vol = round(vol / avg_v, 2) if vol and avg_v and avg_v > 0 else None
+            sma20v  = sma(close, 20).iloc[-1]
+            sma50v  = sma(close, 50).iloc[-1] if len(close) >= 50 else None
             results.append({
-                "ticker":  ticker,
-                "price":   round(float(close.iloc[-1]), 2),
-                "change":  round(float((close.iloc[-1]-close.iloc[-2])/close.iloc[-2]*100), 2),
-                "rsi":     round(float(r), 1) if not np.isnan(r) else None,
-                "macd":    round(float(m.iloc[-1]), 3) if not np.isnan(m.iloc[-1]) else None,
-                "signal":  round(float(s.iloc[-1]), 3) if not np.isnan(s.iloc[-1]) else None,
-                "sma20":   round(float(sma20v), 2) if not np.isnan(sma20v) else None,
-                "sma50":   round(float(sma50v), 2) if not np.isnan(sma50v) else None,
-                "atr":     round(float(atr_v), 2) if not np.isnan(atr_v) else None,
-                "volume":  int(df["Volume"].iloc[-1]) if "Volume" in df.columns and df["Volume"].iloc[-1] > 0 else None,
-                "above_sma20": bool(close.iloc[-1] > sma20v) if not np.isnan(sma20v) else None,
-                "above_sma50": bool(close.iloc[-1] > sma50v) if not np.isnan(sma50v) else None,
+                "ticker":    ticker,
+                "price":     round(price, 2),
+                "change":    round(change, 2),
+                "rsi":       round(float(r.iloc[-1]), 1) if not pd.isna(r.iloc[-1]) else None,
+                "macd":      round(float(m.iloc[-1]), 3) if not pd.isna(m.iloc[-1]) else None,
+                "signal":    round(float(s.iloc[-1]), 3) if not pd.isna(s.iloc[-1]) else None,
+                "volume":    int(vol) if vol else None,
+                "rel_vol":   rel_vol,
+                "above_sma20": bool(price > sma20v) if not pd.isna(sma20v) else None,
+                "above_sma50": bool(price > sma50v) if sma50v and not pd.isna(sma50v) else None,
+                "macd_cross": "bullish" if m.iloc[-1] > s.iloc[-1] and m.iloc[-2] < s.iloc[-2] else
+                              "bearish" if m.iloc[-1] < s.iloc[-1] and m.iloc[-2] > s.iloc[-2] else "none",
             })
         except: continue
     return {"results": results}
@@ -432,43 +573,28 @@ def screener(tickers: str = Query(...)):
 @app.get("/api/correlations")
 def correlations(tickers: str = Query(...), start: str = Query(...), end: str = Query(...)):
     closes = {}
-    for ticker in tickers.split(",")[:10]:
+    for ticker in tickers.split(",")[:12]:
         ticker = ticker.strip().upper()
+        if not ticker: continue
         try:
             df = get_data(ticker, start, end)
             closes[ticker] = df["Close"]
         except: continue
-    if len(closes) < 2:
-        raise HTTPException(status_code=400, detail="Need at least 2 valid tickers")
-    corr = pd.DataFrame(closes).dropna().pct_change().dropna().corr()
+    if len(closes) < 2: raise HTTPException(400, "Need at least 2 valid tickers")
+    combined = pd.DataFrame(closes).dropna()
+    corr = combined.pct_change().dropna().corr()
     return {"tickers": list(closes.keys()), "matrix": corr.round(3).to_dict()}
 
-@app.get("/api/earnings")
-def earnings(ticker: str = Query(...)):
-    try:
-        # Use Polygon for earnings data
-        r = requests.get(f"{POLY_BASE}/v2/reference/financials/{ticker.upper()}", params={"apiKey": POLY_KEY, "limit": 8}, timeout=15)
-        data = r.json()
-        results = data.get("results", [])
-        history = []
-        for item in results[:8]:
-            history.append({
-                "fiscalDateEnding": item.get("period_of_report_date", ""),
-                "reportedEPS": item.get("financials", {}).get("income_statement", {}).get("basic_earnings_per_share", {}).get("value"),
-                "estimatedEPS": None,
-                "reportedRevenue": item.get("financials", {}).get("income_statement", {}).get("revenues", {}).get("value"),
-            })
-        return {"upcoming": {}, "history": history}
-    except Exception as e:
-        return {"upcoming": {}, "history": [], "error": str(e)}
-
 @app.get("/api/monte-carlo")
-def monte_carlo(ticker: str = Query(...), start: str = Query(...), end: str = Query(...), simulations: int = Query(200), days: int = Query(252), capital: float = Query(10000)):
+def monte_carlo(ticker: str = Query(...), start: str = Query(...), end: str = Query(...),
+                simulations: int = Query(500), days: int = Query(252), capital: float = Query(10000)):
+    if capital <= 0: raise HTTPException(400, "Capital must be positive")
     df = get_data(ticker, start, end)
-    rets = df["Close"].pct_change().dropna()
-    mu, sigma = float(rets.mean()), float(rets.std())
+    close = df["Close"]
+    returns = close.pct_change().dropna()
+    mu, sigma = float(returns.mean()), float(returns.std())
     paths, finals = [], []
-    for _ in range(min(simulations, 500)):
+    for _ in range(min(simulations, 1000)):
         path = [capital]
         for _ in range(days):
             path.append(path[-1] * (1 + np.random.normal(mu, sigma)))
@@ -478,7 +604,7 @@ def monte_carlo(ticker: str = Query(...), start: str = Query(...), end: str = Qu
     return {
         "simulations":   len(paths),
         "days":          days,
-        "paths":         paths[:50],
+        "paths":         paths[:80],
         "final_median":  round(float(np.median(fa)), 2),
         "final_mean":    round(float(np.mean(fa)), 2),
         "percentile_5":  round(float(np.percentile(fa, 5)), 2),
@@ -487,3 +613,44 @@ def monte_carlo(ticker: str = Query(...), start: str = Query(...), end: str = Qu
         "percentile_95": round(float(np.percentile(fa, 95)), 2),
         "prob_profit":   round(float(np.mean(fa > capital) * 100), 1),
     }
+
+@app.get("/api/market-data")
+def market_data():
+    """Live market snapshot for dashboard/heatmap"""
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+    WATCHLIST = ["SPY","QQQ","IWM","GLD","TLT","XLK","XLV","XLF","XLE","XLY","XLI","XLC"]
+    results = []
+    for t in WATCHLIST:
+        try:
+            df = get_data(t, start, end)
+            close = df["Close"]
+            if len(close) < 2: continue
+            chg = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100
+            results.append({"ticker": t, "price": round(float(close.iloc[-1]),2), "change": round(float(chg),2)})
+        except: continue
+    return {"data": results, "updated": datetime.now().isoformat()}
+
+@app.get("/api/earnings")
+def earnings(ticker: str = Query(...)):
+    """Earnings data via Stooq price history"""
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=365*3)).strftime("%Y-%m-%d")
+    try:
+        df = get_data(ticker, start, end)
+        close = df["Close"]
+        # Approximate earnings dates by finding large single-day moves
+        pct_change = close.pct_change()
+        big_moves = pct_change[abs(pct_change) > 0.04].tail(12)
+        history = []
+        for date, move in big_moves.items():
+            history.append({
+                "date":    str(date.date()),
+                "move":    round(float(move * 100), 2),
+                "price":   round(float(close[date]), 2),
+                "type":    "Beat" if move > 0 else "Miss",
+            })
+        history.reverse()
+        return {"ticker": ticker.upper(), "history": history, "note": "Large single-day moves (>4%) shown as potential earnings events"}
+    except Exception as e:
+        raise HTTPException(404, str(e))
